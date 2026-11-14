@@ -1,0 +1,257 @@
+
+import os
+import logging
+
+from pathlib import Path
+from datetime import datetime
+
+from dotenv import load_dotenv
+from twilio.rest import Client
+from twilio.base.exceptions import TwilioRestException
+
+
+# --------------------------------------------------
+# CONFIGURATION
+# --------------------------------------------------
+
+logger = logging.getLogger("mindshield.twilio")
+
+BASE_DIR = Path(__file__).resolve().parents[2]
+
+load_dotenv(BASE_DIR / ".env", override=True)
+
+
+# --------------------------------------------------
+# GET TWILIO CREDENTIALS
+# --------------------------------------------------
+
+def get_twilio_client():
+
+    account_sid = os.getenv("TWILIO_ACCOUNT_SID")
+
+
+
+    auth_token = os.getenv("TWILIO_AUTH_TOKEN")
+
+    if not account_sid or not auth_token:
+        raise ValueError(
+            "Twilio credentials are missing. "
+            "Check the root .env file."
+        )
+
+    return Client(account_sid, auth_token)
+
+
+# --------------------------------------------------
+# FORMAT SENSOR VALUES
+# --------------------------------------------------
+
+def format_value(value, unit=""):
+
+    if value is None:
+        return "Not available"
+
+    return f"{value} {unit}".strip()
+
+
+# --------------------------------------------------
+# SEND WHATSAPP SOS
+# --------------------------------------------------
+
+def send_sos_sms(
+    patient_name,
+    reason,
+    latitude,
+    longitude,
+    stress_mindset="UNKNOWN",
+    ai_probability=0.0,
+    heart_rate=None,
+    hrv=None,
+    respiration=None,
+    eda=None,
+    notes="Auto-triggered by MindShield AI",
+    ai_explanation=None,cc ccc
+    warning_seconds=None,
+):
+
+    # ----------------------------------------------
+    # VALIDATE CONFIGURATION
+    # ----------------------------------------------
+
+    client = get_twilio_client()
+
+    from_number = os.getenv("TWILIO_PHONE_NUMBER")
+    to_number = os.getenv("SOS_PHONE_NUMBER")
+
+    if not from_number or not to_numcccccc        raise ValueError(
+            "WhatsApp sender or recipient is missing "
+            "from the .env file."
+        )
+
+    if not from_number.startswith("whatsapp:"):
+        raise ValueError(
+            "TWILIO_PHONE_NUMBER must start with whatsapp:"
+        )
+
+    if not to_number.startswith("whatsapp:"):
+        raise ValueError(
+            "SOS_PHONE_NUMBER must start with whatsapp:"
+        )
+
+    # ----------------------------------------------
+    # LOCATION LINK
+    # ----------------------------------------------
+
+    if not (-90 <= latitude <= 90):
+        raise ValueError("Invalid latitude.")
+
+    if not (-180 <= longitude <= 180):
+        raise ValueError("Invalid longitude.")
+
+    location_link = (
+        f"https://www.openstreetmap.org/"
+        f"?mlat={latitude}&mlon={longitude}"
+        f"#map=18/{latitude}/{longitude}"
+    )
+
+    # ----------------------------------------------
+    # AI SEVERITY
+    # ----------------------------------------------
+
+    if ai_probability >= 0.80:
+        severity = "HIGH"
+
+    elif ai_probability >= 0.50:
+        severity = "MEDIUM"
+
+    else:
+        severity = "LOW"
+
+    probability_percent = ai_probability * 100
+
+    # ----------------------------------------------
+    # BUILD AI EXPLANATION
+    # ----------------------------------------------
+
+    explanation_text = ""
+
+    if ai_explanation:
+
+        explanation_text = (
+            "\n\n🔍 AI EXPLANATION (provided drivers):"
+        )
+
+        for item in ai_explanation[:5]:
+
+            name = item.get("name", "Unknown")
+            value = item.get("value", 0)
+
+            direction = "↑" if value > 0 else "↓"
+
+            explanation_text += (
+                f"\n{direction} {name}: {value:.3f}"
+            )
+
+    # ----------------------------------------------
+    # WARNING INFORMATION
+    # ----------------------------------------------
+
+    warning_text = ""
+
+    if warning_seconds is not None:
+
+        warning_text = (
+            f"\n\n⏱ Pre-Attack Warning: "
+            f"~{warning_seconds}s"
+        )
+
+    # ----------------------------------------------
+    # CURRENT TIMESTAMP
+    # ----------------------------------------------
+
+    timestamp = datetime.now().astimezone().strftime(
+        "%d-%m-%Y %I:%M:%S %p %Z"
+    )
+
+    # ----------------------------------------------
+    # BUILD WHATSAPP MESSAGE
+    # ----------------------------------------------
+
+    message_body = f"""
+🤖 MINDSHIELD V2.0
+🚨 SOS EMERGENCY ALERT
+
+Patient: {patient_name}
+
+🧠 Stress Mindset: {stress_mindset}
+⚠️ AI Severity: {severity}
+AI Probability: {probability_percent:.2f}%
+
+❤️ Heart Rate: {format_value(heart_rate, "bpm")}
+📊 HRV: {format_value(hrv, "ms")}
+🌬️ Respiration: {format_value(respiration, "/min")}
+⚡ EDA: {format_value(eda, "μS")}
+
+📝 Reason: {reason}
+Notes: {notes}
+{explanation_text}
+{warning_text}
+
+━━━━━━━━━━━━━━━━━━━━
+
+📍 PATIENT LOCATION:
+
+{location_link}
+
+🕐 Timestamp: {timestamp}
+
+This is an experimental AI-generated alert.
+It is not a medical diagnosis.
+""".strip()
+
+    # ----------------------------------------------
+    # SEND WHATSAPP MESSAGE
+    # ----------------------------------------------
+
+    try:
+
+        message = client.messages.create(
+            body=message_body,
+            from_=from_number,
+            to=to_number,
+        )
+
+        logger.info(
+            "WhatsApp SOS sent. SID: %s",
+            message.sid,
+        )
+
+        return {
+            "success": True,
+            "channel": "WhatsApp",
+            "message_sid": message.sid,
+            "message_status": message.status,
+            "location_link": location_link,
+            "severity": severity,
+            "recipient": to_number,
+        }
+
+    except TwilioRestException as exc:
+
+        logger.exception(
+            "Twilio WhatsApp API error."
+        )
+
+        raise RuntimeError(
+            f"Twilio error {exc.code}: {exc.msg}"
+        ) from exc
+
+    except Exception as exc:
+
+        logger.exception(
+            "Unexpected WhatsApp sending error."
+        )
+
+        raise RuntimeError(
+            f"WhatsApp sending failed: {str(exc)}"
+        ) from exc
