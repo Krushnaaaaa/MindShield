@@ -1,14 +1,15 @@
 
 from pathlib import Path
+from contextlib import contextmanager
+import json
 import logging
-from collections import deque
+import sqlite3
 from datetime import datetime, timezone
-from threading import Lock
 
 import joblib
 import pandas as pd
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -24,7 +25,7 @@ logger = logging.getLogger("mindshield")
 
 
 # --------------------------------------------------
-# PATHS AND MODEL
+# PATHS, MODEL AND DATABASE
 # --------------------------------------------------
 
 BASE_DIR = Path(__file__).resolve().parents[1]
@@ -35,6 +36,11 @@ MODEL_PATH = (
     / "data"
     / "processed"
     / "mindshield_stress_model.pkl"
+)
+
+DATABASE_PATH = (
+    Path(__file__).resolve().parent
+    / "mindshield_history.db"
 )
 
 model = None
@@ -72,6 +78,141 @@ FEATURES = [
 
 
 # --------------------------------------------------
+# DATABASE CONNECTION
+# --------------------------------------------------
+
+@contextmanager
+def get_db_connection():
+    connection = sqlite3.connect(DATABASE_PATH)
+    connection.row_factory = sqlite3.Row
+
+    try:
+        yield connection
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+# --------------------------------------------------
+# DATABASE INITIALIZATION
+# --------------------------------------------------
+
+def initialize_database():
+
+    try:
+        with get_db_connection() as connection:
+
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS sensor_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    received_at TEXT NOT NULL,
+                    reading_json TEXT NOT NULL
+                )
+            """)
+
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS sos_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL,
+                    patient_name TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    request_json TEXT NOT NULL,
+                    response_json TEXT,
+                    error_message TEXT
+                )
+            """)
+
+            connection.execute("""
+                CREATE INDEX IF NOT EXISTS idx_sensor_received_at
+                ON sensor_history(received_at)
+            """)
+
+            connection.execute("""
+                CREATE INDEX IF NOT EXISTS idx_sos_created_at
+                ON sos_history(created_at)
+            """)
+
+        logger.info(
+            "MindShield SQLite database initialized: %s",
+            DATABASE_PATH,
+        )
+
+    except Exception:
+        logger.exception(
+            "Could not initialize MindShield database."
+        )
+        raise
+
+
+# --------------------------------------------------
+# SAVE SENSOR READING
+# --------------------------------------------------
+
+def save_sensor_reading(reading):
+
+    with get_db_connection() as connection:
+
+        cursor = connection.execute(
+            """
+            INSERT INTO sensor_history (
+                received_at,
+                reading_json
+            )
+            VALUES (?, ?)
+            """,
+            (
+                reading["received_at"],
+                json.dumps(reading),
+            ),
+        )
+
+        return cursor.lastrowid
+
+
+# --------------------------------------------------
+# SAVE SOS EVENT
+# --------------------------------------------------
+
+def save_sos_event(
+    request_data,
+    status,
+    response_data=None,
+    error_message=None,
+):
+
+    with get_db_connection() as connection:
+
+        cursor = connection.execute(
+            """
+            INSERT INTO sos_history (
+                created_at,
+                patient_name,
+                status,
+                request_json,
+                response_json,
+                error_message
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                datetime.now(timezone.utc).isoformat(),
+                request_data.get("patient_name", "Patient"),
+                status,
+                json.dumps(request_data, default=str),
+                json.dumps(response_data, default=str)
+                if response_data is not None
+                else None,
+                error_message,
+            ),
+        )
+
+        return cursor.lastrowid
+
+
+# --------------------------------------------------
 # FASTAPI APPLICATION
 # --------------------------------------------------
 
@@ -79,9 +220,10 @@ app = FastAPI(
     title="MindShield Backend API",
     description=(
         "MindShield AI stress prediction, "
-        "ESP32 sensor monitoring and SOS alert system"
+        "ESP32 sensor monitoring, patient history "
+        "and SOS alert system"
     ),
-    version="2.4.0",
+    version="2.5.0",
 )
 
 app.add_middleware(
@@ -114,6 +256,7 @@ class AIExplanationItem(BaseModel):
 
 
 class SOSRequest(BaseModel):
+
     patient_name: str = Field(
         default="Patient",
         min_length=1,
@@ -161,9 +304,12 @@ class SOSRequest(BaseModel):
     )
 
 
+# --------------------------------------------------
 # ESP32 SENSOR DATA MODEL
+# --------------------------------------------------
 
 class SensorReading(BaseModel):
+
     t: float
 
     hr_bpm: float | None = None
@@ -207,27 +353,25 @@ class SensorReading(BaseModel):
 
 
 # --------------------------------------------------
-# ESP32 SENSOR STORAGE
-# --------------------------------------------------
-
-sensor_readings = deque(maxlen=300)
-sensor_lock = Lock()
-
-
-# --------------------------------------------------
-# LOAD WESAD MODEL
+# STARTUP: DATABASE AND WESAD MODEL
 # --------------------------------------------------
 
 @app.on_event("startup")
-def load_model():
+def startup_tasks():
+
     global model
 
+    initialize_database()
+
     try:
+
         if not MODEL_PATH.exists():
+
             logger.error(
                 "WESAD model not found: %s",
                 MODEL_PATH,
             )
+
             return
 
         model = joblib.load(MODEL_PATH)
@@ -237,6 +381,7 @@ def load_model():
         )
 
     except Exception:
+
         logger.exception(
             "Could not load WESAD model."
         )
@@ -248,10 +393,12 @@ def load_model():
 
 @app.get("/")
 def home():
+
     return {
         "message": "Welcome to MindShield Backend",
-        "version": "2.4.0",
+        "version": "2.5.0",
         "status": "running",
+        "database": "SQLite",
         "endpoints": [
             "/health",
             "/models",
@@ -260,6 +407,8 @@ def home():
             "/sos",
             "/api/readings",
             "/api/readings/latest",
+            "/api/readings/history",
+            "/api/sos/history",
         ],
     }
 
@@ -270,9 +419,12 @@ def home():
 
 @app.get("/health")
 def health():
+
     return {
         "status": "healthy",
         "wesad_model_loaded": model is not None,
+        "database": "SQLite",
+        "database_path": str(DATABASE_PATH),
         "sos_endpoint": "available",
         "esp32_sensor_endpoint": "available",
     }
@@ -284,6 +436,7 @@ def health():
 
 @app.get("/models")
 def get_models():
+
     return {
         "available_models": [
             {
@@ -304,12 +457,14 @@ def get_models():
 def predict_wesad(data: PredictionInput):
 
     if model is None:
+
         raise HTTPException(
             status_code=503,
             detail="WESAD model is not loaded.",
         )
 
     try:
+
         missing_features = [
             feature
             for feature in FEATURES
@@ -317,6 +472,7 @@ def predict_wesad(data: PredictionInput):
         ]
 
         if missing_features:
+
             raise HTTPException(
                 status_code=400,
                 detail={
@@ -340,11 +496,13 @@ def predict_wesad(data: PredictionInput):
         stress_probability = 0.0
 
         if hasattr(model, "predict_proba"):
+
             probabilities = model.predict_proba(input_df)[0]
 
             classes = list(model.classes_)
 
             if 1 in classes:
+
                 stress_index = classes.index(1)
 
                 stress_probability = float(
@@ -379,6 +537,7 @@ def predict_wesad(data: PredictionInput):
         raise
 
     except Exception as exc:
+
         logger.exception(
             "WESAD prediction failed."
         )
@@ -390,7 +549,7 @@ def predict_wesad(data: PredictionInput):
 
 
 # --------------------------------------------------
-# ESP32 SENSOR READING - RECEIVE DATA
+# ESP32: RECEIVE AND SAVE SENSOR DATA
 # --------------------------------------------------
 
 @app.post("/api/readings")
@@ -402,42 +561,173 @@ def receive_sensor_reading(data: SensorReading):
         timezone.utc
     ).isoformat()
 
-    with sensor_lock:
-        sensor_readings.append(reading)
+    try:
 
-    logger.info(
-        "ESP32 sensor reading received."
-    )
+        record_id = save_sensor_reading(reading)
 
-    return {
-        "success": True,
-        "message": "Sensor reading received successfully.",
-        "ml_prediction": "PENDING_FEATURE_PIPELINE",
-        "reading": reading,
-    }
+        logger.info(
+            "ESP32 sensor reading saved. ID: %s",
+            record_id,
+        )
+
+        return {
+            "success": True,
+            "message": "Sensor reading received and saved.",
+            "id": record_id,
+            "ml_prediction": "PENDING_FEATURE_PIPELINE",
+            "reading": reading,
+        }
+
+    except Exception as exc:
+
+        logger.exception(
+            "Could not save sensor reading."
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail="Could not save sensor reading.",
+        ) from exc
 
 
 # --------------------------------------------------
-# ESP32 SENSOR READING - GET LATEST DATA
+# ESP32: GET LATEST SENSOR DATA
 # --------------------------------------------------
 
 @app.get("/api/readings/latest")
 def get_latest_reading():
 
-    with sensor_lock:
-        if not sensor_readings:
+    try:
+
+        with get_db_connection() as connection:
+
+            row = connection.execute(
+                """
+                SELECT id, reading_json
+                FROM sensor_history
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+
+        if row is None:
+
             return {
                 "success": False,
                 "message": "No sensor readings received yet.",
                 "reading": None,
             }
 
-        latest = sensor_readings[-1]
+        reading = json.loads(row["reading_json"])
+        reading["id"] = row["id"]
 
-    return {
-        "success": True,
-        "reading": latest,
-    }
+        return {
+            "success": True,
+            "reading": reading,
+        }
+
+    except Exception as exc:
+
+        logger.exception(
+            "Could not retrieve latest reading."
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail="Could not retrieve latest sensor reading.",
+        ) from exc
+
+
+# --------------------------------------------------
+# PATIENT SENSOR HISTORY
+# --------------------------------------------------
+
+@app.get("/api/readings/history")
+def get_reading_history(
+    limit: int = Query(default=300, ge=1, le=5000),
+    offset: int = Query(default=0, ge=0),
+    start_date: str | None = Query(default=None),
+    end_date: str | None = Query(default=None),
+):
+
+    try:
+
+        conditions = []
+        parameters = []
+
+        if start_date:
+
+            conditions.append(
+                "substr(received_at, 1, 10) >= ?"
+            )
+
+            parameters.append(start_date)
+
+        if end_date:
+
+            conditions.append(
+                "substr(received_at, 1, 10) <= ?"
+            )
+
+            parameters.append(end_date)
+
+        where_clause = (
+            "WHERE " + " AND ".join(conditions)
+            if conditions
+            else ""
+        )
+
+        with get_db_connection() as connection:
+
+            total = connection.execute(
+                f"""
+                SELECT COUNT(*) AS total
+                FROM sensor_history
+                {where_clause}
+                """,
+                parameters,
+            ).fetchone()["total"]
+
+            rows = connection.execute(
+                f"""
+                SELECT id, received_at, reading_json
+                FROM sensor_history
+                {where_clause}
+                ORDER BY id DESC
+                LIMIT ? OFFSET ?
+                """,
+                parameters + [limit, offset],
+            ).fetchall()
+
+        readings = []
+
+        for row in rows:
+
+            reading = json.loads(row["reading_json"])
+
+            reading["id"] = row["id"]
+            reading["received_at"] = row["received_at"]
+
+            readings.append(reading)
+
+        return {
+            "success": True,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "readings": readings,
+        }
+
+    except Exception as exc:
+
+        logger.exception(
+            "Could not retrieve sensor history."
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail="Could not retrieve patient sensor history.",
+        ) from exc
 
 
 # --------------------------------------------------
@@ -452,7 +742,10 @@ def trigger_sos(data: SOSRequest):
         data.patient_name,
     )
 
+    request_data = data.model_dump(mode="json")
+
     try:
+
         result = send_sos_sms(
             patient_name=data.patient_name,
             reason=data.reason,
@@ -472,8 +765,14 @@ def trigger_sos(data: SOSRequest):
             warning_seconds=data.warning_seconds,
         )
 
+        save_sos_event(
+            request_data=request_data,
+            status="PROCESSED",
+            response_data=result,
+        )
+
         logger.info(
-            "SOS SMS request completed."
+            "SOS request processed."
         )
 
         return {
@@ -483,10 +782,25 @@ def trigger_sos(data: SOSRequest):
         }
 
     except ValueError as exc:
+
         logger.error(
             "SOS configuration error: %s",
             str(exc),
         )
+
+        try:
+
+            save_sos_event(
+                request_data=request_data,
+                status="FAILED",
+                error_message=str(exc),
+            )
+
+        except Exception:
+
+            logger.exception(
+                "Could not save failed SOS event."
+            )
 
         raise HTTPException(
             status_code=400,
@@ -494,11 +808,95 @@ def trigger_sos(data: SOSRequest):
         ) from exc
 
     except Exception as exc:
+
         logger.exception(
             "SOS SMS sending failed."
         )
 
+        try:
+
+            save_sos_event(
+                request_data=request_data,
+                status="FAILED",
+                error_message=str(exc),
+            )
+
+        except Exception:
+
+            logger.exception(
+                "Could not save failed SOS event."
+            )
+
         raise HTTPException(
             status_code=502,
             detail=f"SOS SMS failed: {str(exc)}",
+        ) from exc
+
+
+# --------------------------------------------------
+# PATIENT SOS HISTORY
+# --------------------------------------------------
+
+@app.get("/api/sos/history")
+def get_sos_history(
+    limit: int = Query(default=100, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
+):
+
+    try:
+
+        with get_db_connection() as connection:
+
+            total = connection.execute(
+                """
+                SELECT COUNT(*) AS total
+                FROM sos_history
+                """
+            ).fetchone()["total"]
+
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM sos_history
+                ORDER BY id DESC
+                LIMIT ? OFFSET ?
+                """,
+                (limit, offset),
+            ).fetchall()
+
+        events = []
+
+        for row in rows:
+
+            events.append({
+                "id": row["id"],
+                "created_at": row["created_at"],
+                "patient_name": row["patient_name"],
+                "status": row["status"],
+                "request": json.loads(row["request_json"]),
+                "response": (
+                    json.loads(row["response_json"])
+                    if row["response_json"]
+                    else None
+                ),
+                "error_message": row["error_message"],
+            })
+
+        return {
+            "success": True,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "events": events,
+        }
+
+    except Exception as exc:
+
+        logger.exception(
+            "Could not retrieve SOS history."
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail="Could not retrieve SOS history.",
         ) from exc

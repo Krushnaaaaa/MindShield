@@ -10,9 +10,9 @@ from twilio.rest import Client
 from twilio.base.exceptions import TwilioRestException
 
 
-# --------------------------------------------------
+# ==================================================
 # CONFIGURATION
-# --------------------------------------------------
+# ==================================================
 
 logger = logging.getLogger("mindshield.twilio")
 
@@ -21,9 +21,9 @@ BASE_DIR = Path(__file__).resolve().parents[2]
 load_dotenv(BASE_DIR / ".env", override=True)
 
 
-# --------------------------------------------------
-# GET TWILIO CREDENTIALS
-# --------------------------------------------------
+# ==================================================
+# GET TWILIO CLIENT
+# ==================================================
 
 def get_twilio_client():
 
@@ -32,16 +32,16 @@ def get_twilio_client():
 
     if not account_sid or not auth_token:
         raise ValueError(
-            "Twilio credentials are missing. "
-            "Check the root .env file."
+            "Twilio credentials missing. "
+            "Check your root .env file."
         )
 
     return Client(account_sid, auth_token)
 
 
-# --------------------------------------------------
+# ==================================================
 # FORMAT SENSOR VALUES
-# --------------------------------------------------
+# ==================================================
 
 def format_value(value, unit=""):
 
@@ -51,9 +51,9 @@ def format_value(value, unit=""):
     return f"{value} {unit}".strip()
 
 
-# --------------------------------------------------
+# ==================================================
 # SEND WHATSAPP SOS
-# --------------------------------------------------
+# ==================================================
 
 def send_sos_sms(
     patient_name,
@@ -72,7 +72,7 @@ def send_sos_sms(
 ):
 
     # ----------------------------------------------
-    # VALIDATE CONFIGURATION
+    # INITIALIZE TWILIO
     # ----------------------------------------------
 
     client = get_twilio_client()
@@ -82,8 +82,8 @@ def send_sos_sms(
 
     if not from_number or not to_number:
         raise ValueError(
-            "WhatsApp sender or recipient is missing "
-            "from the .env file."
+            "WhatsApp sender or recipient missing "
+            "from the root .env file."
         )
 
     if not from_number.startswith("whatsapp:"):
@@ -97,8 +97,11 @@ def send_sos_sms(
         )
 
     # ----------------------------------------------
-    # LOCATION LINK
+    # VALIDATE LOCATION
     # ----------------------------------------------
+
+    if latitude is None or longitude is None:
+        raise ValueError("GPS coordinates are required.")
 
     if not (-90 <= latitude <= 90):
         raise ValueError("Invalid latitude.")
@@ -107,7 +110,7 @@ def send_sos_sms(
         raise ValueError("Invalid longitude.")
 
     location_link = (
-        f"https://www.openstreetmap.org/"
+        "https://www.openstreetmap.org/"
         f"?mlat={latitude}&mlon={longitude}"
         f"#map=18/{latitude}/{longitude}"
     )
@@ -116,19 +119,20 @@ def send_sos_sms(
     # AI SEVERITY
     # ----------------------------------------------
 
+    if not 0 <= ai_probability <= 1:
+        raise ValueError("AI probability must be between 0 and 1.")
+
     if ai_probability >= 0.80:
         severity = "HIGH"
-
     elif ai_probability >= 0.50:
         severity = "MEDIUM"
-
     else:
         severity = "LOW"
 
     probability_percent = ai_probability * 100
 
     # ----------------------------------------------
-    # BUILD AI EXPLANATION
+    # AI EXPLANATION
     # ----------------------------------------------
 
     explanation_text = ""
@@ -136,13 +140,13 @@ def send_sos_sms(
     if ai_explanation:
 
         explanation_text = (
-            "\n\n🔍 AI EXPLANATION (provided drivers):"
+            "\n\n🔍 AI EXPLANATION (TOP DRIVERS):"
         )
 
         for item in ai_explanation[:5]:
 
             name = item.get("name", "Unknown")
-            value = item.get("value", 0)
+            value = float(item.get("value", 0))
 
             direction = "↑" if value > 0 else "↓"
 
@@ -151,7 +155,7 @@ def send_sos_sms(
             )
 
     # ----------------------------------------------
-    # WARNING INFORMATION
+    # PRE-ATTACK WARNING
     # ----------------------------------------------
 
     warning_text = ""
@@ -160,11 +164,11 @@ def send_sos_sms(
 
         warning_text = (
             f"\n\n⏱ Pre-Attack Warning: "
-            f"~{warning_seconds}s"
+            f"~{warning_seconds}s to estimated peak"
         )
 
     # ----------------------------------------------
-    # CURRENT TIMESTAMP
+    # TIMESTAMP
     # ----------------------------------------------
 
     timestamp = datetime.now().astimezone().strftime(
@@ -176,14 +180,12 @@ def send_sos_sms(
     # ----------------------------------------------
 
     message_body = f"""
-🤖 MINDSHIELD V2.0
-🚨 SOS EMERGENCY ALERT
+🤖 AUTO-TRIGGERED — MINDSHIELD v2.0
 
 Patient: {patient_name}
 
 🧠 Stress Mindset: {stress_mindset}
-⚠️ AI Severity: {severity}
-AI Probability: {probability_percent:.2f}%
+⚠️ AI Severity: {severity} (p={ai_probability:.2f})
 
 ❤️ Heart Rate: {format_value(heart_rate, "bpm")}
 📊 HRV: {format_value(hrv, "ms")}
@@ -195,33 +197,40 @@ Notes: {notes}
 {explanation_text}
 {warning_text}
 
-━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-📍 PATIENT LOCATION:
-
+📍 Location:
 {location_link}
 
-🕐 Timestamp: {timestamp}
+🕐 {timestamp}
 
-This is an experimental AI-generated alert.
-It is not a medical diagnosis.
+This is an experimental AI-generated alert,
+not a medical diagnosis.
 """.strip()
 
+    
     # ----------------------------------------------
-    # SEND WHATSAPP MESSAGE
+    # SEND WHATSAPP TEMPLATE
     # ----------------------------------------------
 
     try:
+        content_sid = os.getenv("TWILIO_CONTENT_SID")
+
+        if not content_sid:
+            raise ValueError(
+                "TWILIO_CONTENT_SID is missing from .env"
+            )
 
         message = client.messages.create(
-            body=message_body,
+            content_sid=content_sid,
             from_=from_number,
-            to=to_number,
+            to=to_number
         )
 
         logger.info(
-            "WhatsApp SOS sent. SID: %s",
+            "WhatsApp SOS template accepted. SID: %s | Status: %s",
             message.sid,
+            message.status
         )
 
         return {
@@ -231,25 +240,17 @@ It is not a medical diagnosis.
             "message_status": message.status,
             "location_link": location_link,
             "severity": severity,
-            "recipient": to_number,
+            "recipient": to_number
         }
 
     except TwilioRestException as exc:
-
-        logger.exception(
-            "Twilio WhatsApp API error."
-        )
-
+        logger.exception("Twilio WhatsApp API error.")
         raise RuntimeError(
             f"Twilio error {exc.code}: {exc.msg}"
         ) from exc
 
     except Exception as exc:
-
-        logger.exception(
-            "Unexpected WhatsApp sending error."
-        )
-
+        logger.exception("WhatsApp sending failed.")
         raise RuntimeError(
             f"WhatsApp sending failed: {str(exc)}"
         ) from exc
